@@ -2,70 +2,53 @@ mod misc;
 mod taskmod;
 use colored::Colorize;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 use misc::{
-    functions::{input, is_valid_status},
+    functions::{display_warning, input, send_edit_status},
     vals::{
-        EditStatus, StatusCode, TaskStatus, FILEPATH as filepath, FOLDER_PATH as folder_path,
+        EditStatus, TaskStatus, FILEPATH as filepath, FOLDER_PATH as folder_path,
         GEN_COLOR as gen_color, MAX_TASKS as max_tasks,
     },
 };
-use taskmod::taskmod::BaseTasks;
+use taskmod::task_util_mod::BaseTasks;
 fn main() {
-    const _UNUSED_VAR: &str = "║ ╠ ╦ ═ ╚ ╔ ╩";
     let (sender, receiver) = mpsc::channel();
     let shared_sender = Arc::new(Mutex::new(sender));
     let shared_sender_clone = Arc::clone(&shared_sender);
-    let mut v = 0;
-    let thread1 = thread::spawn(move || {
-        let mut last_modified_time: Option<SystemTime> = None;
-        loop {
-            if v == 0 {
-                v += 1;
-            }
-            let path = Path::new(folder_path);
-            // Check if the tasks directory exists, and create it if not.
-            if !path.exists() {
-                println!("{}", "Test 1 failed: tasks folder does not exist!".red());
-                // Create the tasks directory.
-                // Create the tasks folder.
-                println!("{}", "Creating tasks folder...".yellow());
-                match fs::create_dir_all(folder_path) {
-                    Ok(_) => {
-                        println!(
-                            "{}",
-                            "Tasks folder has successfully been created!".green().bold()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "{} {}",
-                            "There has been an error creating the tasks folder:".red(),
-                            format!("{e}").bright_red()
-                        );
-                        continue;
-                    }
-                } // Create tasks directory.
-            } else {
-            }
-            if Path::new(filepath).exists() {
-            } else {
-                println!("{}", "tasks.json does not exist!".red());
+    let status_acknowledged = Arc::new(AtomicBool::new(true));
+    let status_acknowledged_clone = Arc::clone(&status_acknowledged);
 
-                if let Err(e) = File::create(filepath).and_then(|file| {
-                    BaseTasks::new(&file);
-                    Ok(())
+    let _thread1 = thread::spawn(move || {
+        let mut last_modified_time: Option<SystemTime> = None;
+
+        loop {
+            let path = Path::new(folder_path);
+            if !path.exists() {
+                if let Err(e) = fs::create_dir_all(folder_path) {
+                    eprintln!(
+                        "{} {}",
+                        "There has been an error creating the tasks folder:".red(),
+                        format!("{e}").bright_red()
+                    );
+                    continue;
+                }
+            }
+
+            if !Path::new(filepath).exists() {
+                if let Err(e) = File::create(filepath).map(|file| {
+                    BaseTasks::init(&file);
                 }) {
                     eprintln!(
                         "{} {}",
-                        "Error creating or initializing tasks.json:".red(),
-                        e.to_string().bright_red()
+                        "Error creating or initializing tasks.json:".red().bold(),
+                        e.to_string().bright_red().bold()
                     );
                     continue;
                 }
@@ -75,66 +58,62 @@ fn main() {
                         eprintln!("Error sending message: {}", e);
                     });
                 }
-
-                println!("{}", "tasks.json created and initialized.".green());
             }
+
             if let Ok(mut file) = File::open(filepath) {
                 let mut data = String::new();
-                if let Err(e) = file.read_to_string(&mut data) {
-                    eprintln!(
-                        "{} {}",
-                        "Error reading tasks.json:".red(),
-                        e.to_string().bright_red()
-                    );
+                if file.read_to_string(&mut data).is_err() {
                     continue;
                 }
 
                 if data.trim().is_empty() {
-                    println!("{}", "tasks.json is empty!".yellow());
-
-                    if let Err(e) = File::create(filepath).and_then(|file| {
-                        BaseTasks::new(&file);
-                        Ok(())
-                    }) {
-                        eprintln!(
-                            "{} {}",
-                            "Error reinitializing tasks.json:".red(),
-                            e.to_string().bright_red()
-                        );
-                        continue;
+                    thread::sleep(Duration::from_millis(300));
+                    if data.trim().is_empty() {
+                        if let Err(e) = File::create(filepath).map(|file| {
+                            BaseTasks::init(&file);
+                            if let Ok(sender) = shared_sender_clone.lock() {
+                                sender.send(EditStatus::Authorized).unwrap_or_else(|e| {
+                                    eprintln!("Error sending message: {}", e);
+                                });
+                            }
+                        }) {
+                            eprintln!(
+                                "{} {}",
+                                "Error reinitializing tasks.json:".red().bold(),
+                                e.to_string().bright_red().bold()
+                            );
+                            continue;
+                        }
                     }
-
-                    if let Ok(sender) = shared_sender_clone.lock() {
-                        sender.send(EditStatus::Authorized).unwrap_or_else(|e| {
-                            eprintln!("Error sending message: {}", e);
-                        });
-                    }
-
-                    println!("{}", "tasks.json reinitialized.".green());
                 }
             }
+
             if let Ok(metadata) = fs::metadata(filepath) {
                 if let Ok(modified_time) = metadata.modified() {
                     if let Some(last_time) = last_modified_time {
-                        if modified_time > last_time
-                            && receiver.recv().unwrap() == (EditStatus::Unauthorized)
-                        {
-                            println!("tasks.json has been externally modified!");
+                        if modified_time > last_time {
+                            let rec = match receiver.try_recv() {
+                                Ok(e) => e,
+                                Err(_) => EditStatus::Unauthorized,
+                            };
 
-                            if let Ok(sender) = shared_sender_clone.lock() {
-                                sender.send(EditStatus::Unauthorized).unwrap_or_else(|e| {
-                                    eprintln!("Error sending message: {}", e);
-                                });
+                            match rec {
+                                EditStatus::Authorized => {
+                                    status_acknowledged.store(true, Ordering::SeqCst);
+                                }
+                                _ => {
+                                    display_warning();
+                                }
                             }
                         }
                     }
                     last_modified_time = Some(modified_time);
                 }
             }
-            thread::sleep(Duration::from_millis(1000));
+            thread::sleep(Duration::from_millis(700));
         }
     });
-    thread::sleep(Duration::from_secs(2));
+    thread::sleep(Duration::from_secs(3));
     print!("\x1B[2J\x1B[H");
     io::stdout().flush().unwrap();
     println!(
@@ -153,42 +132,67 @@ fn main() {
                   ░                  ░                    
     "#
         .truecolor(gen_color.0, gen_color.1, gen_color.2)
+        .bold()
     );
     let mut x = 0;
     loop {
         let task_list: Vec<(u16, String, TaskStatus)> =
-            BaseTasks::read_tasks(&File::open(filepath).unwrap()).0;
-        /* BaseTasks::read_tasks(&file).0;*/
+            BaseTasks::read_tasks(&File::open(filepath).unwrap());
         if x == 0 {
-            println!("");
+            println!("\n");
             println!(
                 "{}",
-                "╔═╦[1]: Add Task".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                "╔═╦[1]: Add Task"
+                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                    .bold()
             );
             println!(
                 "{}",
-                "║ ╠[2]: Remove Task".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                "║ ╠[2]: Remove Task"
+                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                    .bold()
             );
             println!(
                 "{}",
-                "║ ╠[3]: Display Tasks".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                "║ ╠[3]: Display Tasks"
+                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                    .bold()
             );
             println!(
                 "{}",
-                "║ ╠[4]: Edit Task".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                "║ ╠[4]: Edit Task"
+                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                    .bold()
             );
             println!(
                 "{}",
-                "║ ╠[5]: Exit".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                "║ ╠[5]: About"
+                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                    .bold()
             );
             println!(
                 "{}",
-                "║ ╚[6]: About".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                "║ ╠[6]: Start over / Clear tasks (if you fucked up the json file or want a fresh start)"
+                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                    .bold()
             );
-            println!("{}", "║".truecolor(gen_color.0, gen_color.1, gen_color.2));
+            thread::sleep(Duration::from_millis(500));
+            println!(
+                "{}",
+                "║ ╚═[7]: Exit"
+                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                    .bold()
+            );
+            println!(
+                "{}",
+                "║".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+            );
+            thread::sleep(Duration::from_millis(400));
             print!(
                 "{}",
-                "╚══╦═[?] > ".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                "╚══╦═[?] > "
+                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                    .bold()
             );
             x += 1;
         } else {
@@ -218,13 +222,19 @@ fn main() {
             );
             println!(
                 "{}",
-                "║  ╠[5]: Exit"
+                "║  ╠[5]: About"
                     .truecolor(gen_color.0, gen_color.1, gen_color.2)
                     .bold()
             );
             println!(
                 "{}",
-                "║  ╚[6]: About"
+                "║  ╠[6]: Start over / Clear tasks "
+                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                    .bold()
+            );
+            println!(
+                "{}",
+                "║  ╚═[7]: Exit"
                     .truecolor(gen_color.0, gen_color.1, gen_color.2)
                     .bold()
             );
@@ -232,6 +242,7 @@ fn main() {
                 "{}",
                 "║".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
             );
+            thread::sleep(Duration::from_millis(400));
             print!(
                 "{}",
                 "╚══╦═[?] > "
@@ -239,370 +250,849 @@ fn main() {
                     .bold()
             );
         }
-        let choice = input(vec!['1', '2', '3', '4', '5', '6']);
+        let choice = input(vec!['1', '2', '3', '4', '5', '6', '7']);
         match choice {
             '1' => {
-                let mut tries = 0;
+                println!(
+                    "   {}",
+                    "╚╗".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                );
                 loop {
                     let mut taskname: String = String::new();
                     print!(
-                        "{}",
-                        "[?] Enter task name > ".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                        "    {}",
+                        "╠══[?] Enter task name > "
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
                     );
                     io::stdout().flush().unwrap();
                     io::stdin()
                         .read_line(&mut taskname)
                         .expect("Failed to read input");
-                    let mut task_status = String::new();
-                    println!(
-                        "{}",
-                        "[?] Enter task status (Pending/Completed/In-progress)".truecolor(
-                            gen_color.0,
-                            gen_color.1,
-                            gen_color.2
-                        )
-                    );
-                    println!(
-                        "{}",
-                        "[?] > ".truecolor(gen_color.0, gen_color.1, gen_color.2)
-                    );
-                    io::stdout().flush().unwrap();
-                    // io::stdin().read_line(&mut task_status).expect("Failed to read input");
-                    // let task_status: TaskStatus = match task_status.parse()
-                    let mut file = match OpenOptions::new().write(true).append(true).open(filepath)
-                    {
-                        Ok(file) => file,
-                        Err(e) => {
-                            eprintln!(
-                                "{} {}",
-                                "There was an error!\n".red(),
-                                format!("Err: {e}").bright_red()
-                            );
-                            tries += 1;
-                            if tries > 3 {
-                                break;
-                            }
-                            continue;
-                        }
-                    };
-                    file.seek(SeekFrom::Start(1)).unwrap();
-                    let res = BaseTasks::add_task(
-                        &file,
-                        &mut BaseTasks {
-                            alltasks: task_list.clone(),
-                        },
-                        String::new(),
-                        TaskStatus::Pending,
-                    );
-                    match res {
-                        Some(StatusCode::Break) => break,
-                        None => continue,
-                    }
-                }
-            }
-
-            '3' => loop {
-                println!(
-                    "\n{}",
-                    "   ║ ".truecolor(gen_color.0, gen_color.1, gen_color.2)
-                );
-                println!(
-                    "{}",
-                    " ╔═╬═[1]: Display In-progress tasks".truecolor(
-                        gen_color.0,
-                        gen_color.1,
-                        gen_color.2
-                    )
-                );
-                println!(
-                    "{}",
-                    " ║ ╠═[2]: Display completed tasks".truecolor(
-                        gen_color.0,
-                        gen_color.1,
-                        gen_color.2
-                    )
-                );
-                println!(
-                    "{}",
-                    " ║ ╠═[3]: Display pending tasks".truecolor(
-                        gen_color.0,
-                        gen_color.1,
-                        gen_color.2
-                    )
-                );
-                println!(
-                    "{}",
-                    " ║ ╠═[4]: Display all tasks".truecolor(gen_color.0, gen_color.1, gen_color.2)
-                );
-                println!(
-                    "{}",
-                    " ║ ╚═[5]: Exit".truecolor(gen_color.0, gen_color.1, gen_color.2)
-                );
-                println!("{}", " ║".truecolor(gen_color.0, gen_color.1, gen_color.2));
-                print!(
-                    "{}",
-                    " ╚╦═══[?] > ".truecolor(gen_color.0, gen_color.1, gen_color.2)
-                );
-                let choice = input(vec!['1', '2', '3', '4', '5']);
-                match choice {
-                    '1' => {
-                        if !task_list
-                            .iter()
-                            .any(|(_, _, status)| *status == TaskStatus::InProgress)
-                        {
-                            println!("    No in-progress tasks.");
-                        } else {
-                            println!("   {}", "".truecolor(gen_color.0, gen_color.1, gen_color.2));
-                            println!(
-                                "   {}",
-                                "╠[TASKS] In-progress tasks:".truecolor(
-                                    gen_color.0,
-                                    gen_color.1,
-                                    gen_color.2
-                                )
-                            );
-                            let mut tasknum = 0;
-                            for (taskid, task_name, task_status) in &task_list {
-                                if *task_status == TaskStatus::InProgress {
-                                    tasknum += 1;
-                                    println!(
-                                        "        {}",
-                                        format!("Task {tasknum}: {task_name} | ID: {taskid}")
-                                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
-                                    );
-                                }
-                            }
-                            continue;
-                        }
-                        continue;
-                    }
-                    '2' => {
-                        if !task_list
-                            .iter()
-                            .any(|(_, _, status)| *status == TaskStatus::Complete)
-                        {
-                            println!(
-                                "{}",
-                                "     No completed tasks".truecolor(
-                                    gen_color.0,
-                                    gen_color.1,
-                                    gen_color.2
-                                )
-                            );
-                        } else {
-                            let mut tasknum: u16 = 0;
-                            println!(
-                                "   {}",
-                                "Completed tasks:".truecolor(gen_color.0, gen_color.1, gen_color.2)
-                            );
-                            for (taskid, task_name, task_status) in &task_list {
-                                if *task_status == TaskStatus::Complete {
-                                    tasknum += 1;
-                                    println!(
-                                        "        {}",
-                                        format!("Task {tasknum}: {task_name} | ID: {taskid} ")
-                                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
-                                    );
-                                }
-                            }
-                            continue;
-                        }
-                        continue;
-                    }
-                    '3' => {
-                        if !task_list
-                            .iter()
-                            .any(|(_, _, status)| *status == TaskStatus::Pending)
-                        {
-                            println!(
-                                "{}",
-                                "     No Pending tasks".truecolor(
-                                    gen_color.0,
-                                    gen_color.1,
-                                    gen_color.2
-                                )
-                            );
-                        } else {
-                            println!(
-                                "   {}",
-                                "Pending tasks:".truecolor(gen_color.0, gen_color.1, gen_color.2)
-                            );
-                            let mut tasknum: u16 = 0;
-                            for (taskid, task_name, task_status) in &task_list {
-                                if *task_status == TaskStatus::Pending {
-                                    tasknum += 1;
-                                    println!(
-                                        "        {}",
-                                        format!("Task {tasknum}: {task_name} | ID: {taskid} ")
-                                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
-                                    );
-                                }
-                            }
-                            continue;
-                        }
-                        continue;
-                    }
-                    '4' => {
+                    if taskname.trim() == "" {
                         println!(
-                            "{}",
-                            "\n  ╠═╦═[Tasks] All tasks:"
+                            "    {}",
+                            "╠══[!] Task name cannot be empty."
                                 .truecolor(gen_color.0, gen_color.1, gen_color.2)
                                 .bold()
                         );
+                        continue;
+                    }
 
-                        if !task_list
-                            .iter()
-                            .any(|(_, _, status)| *status == TaskStatus::Pending)
-                        {
-                            println!(
-                                "{}",
-                                "     No Pending tasks".truecolor(
-                                    gen_color.0,
-                                    gen_color.1,
-                                    gen_color.2
-                                )
-                            );
-                        } else {
-                            let mut tasknum: u16 = 0;
-                            println!(
-                                "  {}",
-                                "║ ╠══[Pending] Pending Tasks: ".truecolor(
-                                    gen_color.0,
-                                    gen_color.1,
-                                    gen_color.2
-                                )
-                            );
-                            println!(
-                                "  {}",
-                                "║ ╠═╗".truecolor(gen_color.0, gen_color.1, gen_color.2)
-                            );
-                            for (taskid, task_name, task_status) in &task_list {
-                                if *task_status == TaskStatus::Pending {
-                                    tasknum += 1;
-                                    println!(
-                                        "  {}",
-                                        format!(
-                                            "║ ║ ╟─Task {tasknum}: {task_name} | ID: {taskid} "
-                                        )
-                                        .truecolor(
-                                            gen_color.0,
-                                            gen_color.1,
-                                            gen_color.2
-                                        )
-                                    );
-                                }
+                    loop {
+                        println!(
+                            "    {}",
+                            "║ [1] Pending"
+                                .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                .bold()
+                        );
+                        println!(
+                            "    {}",
+                            "║ [2] Complete"
+                                .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                .bold()
+                        );
+                        println!(
+                            "    {}",
+                            "║ [3] In-Progress"
+                                .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                .bold()
+                        );
+                        print!(
+                            "    {}",
+                            "╠══[?] Task Status > "
+                                .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                .bold()
+                        );
+                        let choice = input(vec!['1', '2', '3']);
+                        let status = match choice {
+                            '1' => TaskStatus::Pending,
+                            '2' => TaskStatus::Complete,
+                            '3' => TaskStatus::InProgress,
+                            _ => {
+                                continue;
                             }
+                        };
+                        let f2 = File::open(filepath).unwrap();
+                        drop(f2);
+                        BaseTasks::add_task(taskname.clone(), status);
+                        send_edit_status(
+                            Arc::clone(&shared_sender),
+                            Arc::clone(&status_acknowledged_clone),
+                        );
+                        break;
+                    }
+                    print!(
+                        "      {}",
+                        "╠══[?] Would you like to exit? Y/n > "
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    let choice = input(vec!['Y', 'y', 'N', 'n']);
+                    match choice {
+                        'Y' | 'y' => {
                             println!(
-                                "      {}",
-                                "╚═══".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                "  {}",
+                                "╔═══╝"
+                                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                    .bold()
                             );
+                            break;
                         }
-
-                        if !task_list
-                            .iter()
-                            .any(|(_, _, status)| *status == TaskStatus::InProgress)
-                        {
-                            println!(
-                                "  {}",
-                                "║ ╠══[In-Progress] No In-Progress Tasks: ".truecolor(
-                                    gen_color.0,
-                                    gen_color.1,
-                                    gen_color.2
-                                )
-                            );
-                        } else {
-                            let mut tasknum: u16 = 0;
-                            println!(
-                                "  {}",
-                                "║ ╠══[In-Progress] In-Progress Tasks: ".truecolor(
-                                    gen_color.0,
-                                    gen_color.1,
-                                    gen_color.2
-                                )
-                            );
-                            println!(
-                                "  {}",
-                                "║ ╚═╗".truecolor(gen_color.0, gen_color.1, gen_color.2)
-                            );
-                            for (taskid, task_name, task_status) in &task_list {
-                                if *task_status == TaskStatus::InProgress {
-                                    tasknum += 1;
-                                    println!(
-                                        "  {}",
-                                        format!(
-                                            "║   ╟─Task {tasknum}: {task_name} | ID: {taskid} "
-                                        )
-                                        .truecolor(
-                                            gen_color.0,
-                                            gen_color.1,
-                                            gen_color.2
-                                        )
-                                    );
-                                }
-                            }
-                            println!(
-                                "      {}",
-                                "╚═══".truecolor(gen_color.0, gen_color.1, gen_color.2)
-                            );
-                        }
-
-                        if !task_list
-                            .iter()
-                            .any(|(_, _, status)| *status == TaskStatus::Complete)
-                        {
-                            println!(
-                                "{}",
-                                "     No completed tasks".truecolor(
-                                    gen_color.0,
-                                    gen_color.1,
-                                    gen_color.2
-                                )
-                            );
-                            continue;
-                        } else {
-                            let mut tasknum: u16 = 0;
+                        'N' | 'n' => {
                             println!(
                                 "    {}",
-                                "Completed Tasks: ".truecolor(
-                                    gen_color.0,
-                                    gen_color.1,
-                                    gen_color.2
-                                )
+                                "╔═╝"
+                                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                    .bold()
                             );
-                            for (taskid, task_name, task_status) in &task_list {
-                                if *task_status == TaskStatus::Complete {
-                                    tasknum += 1;
-                                    println!(
-                                        "     {}",
-                                        format!("Task {tasknum}: {task_name} | ID: {taskid} ")
-                                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
-                                    );
-                                }
+                        }
+                        _ => {
+                            println!(
+                                "      {}",
+                                "╠══[_] I wonder how you got this message"
+                                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                    .bold()
+                            );
+                        }
+                    }
+                }
+            }
+
+            '2' => loop {
+                println!(
+                    "   {}",
+                    "╚╗".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                );
+                print!(
+                    "    {}",
+                    "╠═[?] ID of task to remove > "
+                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                        .bold()
+                );
+                let mut id_of_task = String::new();
+                io::stdout().flush().unwrap();
+                io::stdin().read_line(&mut id_of_task).unwrap();
+                let id_of_task: u16 = match id_of_task.trim().parse() {
+                    Ok(id) => {
+                        if id > max_tasks as u16 {
+                            println!(
+                                "{}",
+                                "ID is out of range: max number of tasks is 1000!"
+                                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                    .bold()
+                            );
+                            continue;
+                        }
+                        id
+                    }
+                    Err(_) => {
+                        println!(
+                            "    {}",
+                            "╠═[!] Invalid ID. Please enter a positive integer thats under 1001 "
+                                .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                .bold()
+                        );
+                        println!(
+                            "    {}",
+                            "╚╗".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                        );
+                        print!(
+                            "     {}",
+                            "╠═[?] Would you like to exit? Y/n > "
+                                .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                .bold()
+                        );
+                        let choice = input(vec!['Y', 'y', 'N', 'n']);
+                        match choice {
+                            'Y' | 'y' => {
+                                break;
                             }
+                            'N' | 'n' => {}
+                            _ => {}
+                        }
+                        print!(
+                            "     {}",
+                            "╠═[?] Are you lost / need instructions? Y/n > "
+                                .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                .bold()
+                        );
+                        let choice = input(vec!['Y', 'y', 'N', 'n']);
+                        match choice {
+                            'Y' | 'y' => {
+                                println!(
+                                    "     {}",
+                                    "║ Enter the unique ID of the task you want to remove."
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "     {}",
+                                    "║ When you press 3 in the homepage to display tasks"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "     {}",
+                                    "║ The unique ID of every task and status is shown"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "     {}",
+                                    "║ Also, please don't edit the tasks folder or any of its contents".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                                );
+                                print!(
+                                    "    {}",
+                                    "╔╝".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                                );
+                                continue;
+                            }
+                            'N' | 'n' => {
+                                print!(
+                                    "    {}",
+                                    "╔╝".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                                );
+                                continue;
+                            }
+                            _ => {}
                         }
                         continue;
                     }
-                    '5' => {
-                        println!("{}", "Successfully exited".green());
-                        break;
+                };
+                let action = BaseTasks::remove_task(id_of_task);
+                send_edit_status(
+                    Arc::clone(&shared_sender),
+                    Arc::clone(&status_acknowledged_clone),
+                );
+                match action {
+                    't' => {
+                        print!(
+                            "    {}",
+                            "╠═[?] Would you like to exit? Y/n > "
+                                .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                .bold()
+                        );
+                        let choice = input(vec!['Y', 'y', 'N', 'n']);
+                        match choice {
+                            'Y' | 'y' => {
+                                println!(
+                                    "  {}",
+                                    "╔═╝"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                break;
+                            }
+                            'N' | 'n' => {
+                                continue;
+                            }
+                            _ => {}
+                        }
                     }
-                    _ => {
-                        println!("{}", "Invalid choice!\n".red());
+                    'f' => {
+                        continue;
                     }
+                    _ => {}
                 }
             },
-            '5' => {
+
+            '3' => {
                 println!(
-                    "\n{}{}",
-                    "   ╚══[:D] "
-                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
-                        .bold(),
-                    "Goodbye!".green().bold()
+                    "   {}",
+                    "║".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
                 );
-                thread::sleep(Duration::from_secs(1));
-                std::process::exit(0);
+                loop {
+                    println!(
+                        "{}",
+                        " ╔═╬[1]: Display In-progress tasks"
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    println!(
+                        "{}",
+                        " ║ ╠[2]: Display completed tasks"
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    println!(
+                        "{}",
+                        " ║ ╠[3]: Display pending tasks"
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    println!(
+                        "{}",
+                        " ║ ╠[4]: Display all tasks"
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    println!(
+                        "{}",
+                        " ║ ╚═[5]: Exit"
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    println!(
+                        "{}",
+                        " ║".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                    );
+                    print!(
+                        "{}",
+                        " ╚╦═╦═[?] > "
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    let choice = input(vec!['1', '2', '3', '4', '5']);
+                    match choice {
+                        '1' => {
+                            if !task_list
+                                .iter()
+                                .any(|(_, _, status)| *status == TaskStatus::InProgress)
+                            {
+                                println!(
+                                    "  {}",
+                                    "║ ╠══[_] No In-Progress tasks"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "  {}",
+                                    "╚╦╝"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                            } else {
+                                let mut tasknum: u16 = 0;
+                                println!(
+                                    "  {}",
+                                    "║ ╠══[In-Progress] In-Progress Tasks: "
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "  {}",
+                                    "║ ╚═╗".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                );
+                                for (taskid, task_name, task_status) in &task_list {
+                                    if *task_status == TaskStatus::InProgress {
+                                        tasknum += 1;
+                                        println!(
+                                            "  {}",
+                                            format!(
+                                                "║   ╟─Task {tasknum}: {task_name} | ID: {taskid} "
+                                            )
+                                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                            .bold()
+                                        );
+                                    }
+                                }
+                                println!(
+                                    "  {}",
+                                    "║   ╚══[In-Progress]"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "  {}",
+                                    "╚╗".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                                );
+                            }
+                            continue;
+                        }
+                        '2' => {
+                            if !task_list
+                                .iter()
+                                .any(|(_, _, status)| *status == TaskStatus::Complete)
+                            {
+                                println!(
+                                    "  {}",
+                                    "║ ╠══[_] No Completed tasks".truecolor(
+                                        gen_color.0,
+                                        gen_color.1,
+                                        gen_color.2
+                                    )
+                                );
+                                println!(
+                                    "  {}",
+                                    "╚╦╝".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                );
+                            } else {
+                                let mut tasknum: u16 = 0;
+                                println!(
+                                    "  {}",
+                                    "║ ╠══[Completed] Completed Tasks: ".truecolor(
+                                        gen_color.0,
+                                        gen_color.1,
+                                        gen_color.2
+                                    )
+                                );
+                                println!(
+                                    "  {}",
+                                    "║ ╚═╗".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                );
+                                for (taskid, task_name, task_status) in &task_list {
+                                    if *task_status == TaskStatus::Complete {
+                                        tasknum += 1;
+                                        println!(
+                                            "  {}",
+                                            format!(
+                                                "║   ╟─Task {tasknum}: {task_name} | ID: {taskid} "
+                                            )
+                                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        );
+                                    }
+                                }
+                                println!(
+                                    "  {}",
+                                    "║   ╚══[Completed]".truecolor(
+                                        gen_color.0,
+                                        gen_color.1,
+                                        gen_color.2
+                                    )
+                                );
+                                println!(
+                                    "  {}",
+                                    "╚╗".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                );
+                            }
+                            continue;
+                        }
+                        '3' => {
+                            if !task_list
+                                .iter()
+                                .any(|(_, _, status)| *status == TaskStatus::Pending)
+                            {
+                                println!(
+                                    "  {}",
+                                    "║ ╠══[_] No Pending tasks".truecolor(
+                                        gen_color.0,
+                                        gen_color.1,
+                                        gen_color.2
+                                    )
+                                );
+                                println!(
+                                    "  {}",
+                                    "╚╦╝".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                );
+                            } else {
+                                let mut tasknum: u16 = 0;
+                                println!(
+                                    "  {}",
+                                    "║ ╠══[Pending] Pending Tasks: ".truecolor(
+                                        gen_color.0,
+                                        gen_color.1,
+                                        gen_color.2
+                                    )
+                                );
+                                println!(
+                                    "  {}",
+                                    "║ ╚═╗".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                );
+                                for (taskid, task_name, task_status) in &task_list {
+                                    if *task_status == TaskStatus::Pending {
+                                        tasknum += 1;
+                                        println!(
+                                            "  {}",
+                                            format!(
+                                                "║   ╟─Task {tasknum}: {task_name} | ID: {taskid} "
+                                            )
+                                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                            .bold()
+                                        );
+                                    }
+                                }
+                                println!(
+                                    "  {}",
+                                    "║   ╚══[Pending]"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "  {}",
+                                    "╚╗".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                                );
+                            }
+                            continue;
+                        }
+                        '4' => {
+                            println!(
+                                "{}",
+                                "  ╠═╬═[Tasks] All tasks:"
+                                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                    .bold()
+                            );
+
+                            if !task_list
+                                .iter()
+                                .any(|(_, _, status)| *status == TaskStatus::Pending)
+                            {
+                                println!(
+                                    "  {}",
+                                    "║ ╠══[_] No Pending tasks"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "  {}",
+                                    "║ ║".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                );
+                            } else {
+                                let mut tasknum: u16 = 0;
+                                println!(
+                                    "  {}",
+                                    "║ ╠══[Pending] Pending Tasks: "
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "  {}",
+                                    "║ ╠═╗"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                for (taskid, task_name, task_status) in &task_list {
+                                    if *task_status == TaskStatus::Pending {
+                                        tasknum += 1;
+                                        println!(
+                                            "  {}",
+                                            format!(
+                                                "║ ║ ╟─Task {tasknum}: {task_name} | ID: {taskid} "
+                                            )
+                                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                            .bold()
+                                        );
+                                    }
+                                }
+                                println!(
+                                    "  {}",
+                                    "║ ║ ╚══[Pending]"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "  {}",
+                                    "║ ║"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                            }
+
+                            if !task_list
+                                .iter()
+                                .any(|(_, _, status)| *status == TaskStatus::InProgress)
+                            {
+                                println!(
+                                    "  {}",
+                                    "║ ╠══[_] No In-Progress Tasks "
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "  {}",
+                                    "║ ║"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                            } else {
+                                let mut tasknum: u16 = 0;
+                                println!(
+                                    "  {}",
+                                    "║ ╠══[In-Progress] In-Progress Tasks: "
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "  {}",
+                                    "║ ╠═╗"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                for (taskid, task_name, task_status) in &task_list {
+                                    if *task_status == TaskStatus::InProgress {
+                                        tasknum += 1;
+                                        println!(
+                                            "  {}",
+                                            format!(
+                                                "║ ║ ╟─Task {tasknum}: {task_name} | ID: {taskid} "
+                                            )
+                                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                            .bold()
+                                        );
+                                    }
+                                }
+                                println!(
+                                    "  {}",
+                                    "║ ║ ╚══[In-Progress]"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "  {}",
+                                    "║ ║"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                            }
+                            if !task_list
+                                .iter()
+                                .any(|(_, _, status)| *status == TaskStatus::Complete)
+                            {
+                                println!(
+                                    "  {}",
+                                    "║ ╠══[_] No Completed tasks"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "  {}",
+                                    "╚╦╝"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                continue;
+                            } else {
+                                let mut tasknum: u16 = 0;
+                                println!(
+                                    "  {}",
+                                    "║ ╠══[Completed] Completed Tasks: "
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                println!(
+                                    "  {}",
+                                    "║ ╚═╗".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                );
+                                for (taskid, task_name, task_status) in &task_list {
+                                    if *task_status == TaskStatus::Complete {
+                                        tasknum += 1;
+                                        println!(
+                                            "  {}",
+                                            format!(
+                                                "║   ╟─Task {tasknum}: {task_name} | ID: {taskid} "
+                                            )
+                                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                            .bold()
+                                        );
+                                    }
+                                }
+                                println!(
+                                    "  {}",
+                                    "║   ╚══[Completed]"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                            }
+                            println!(
+                                "  {}",
+                                "║".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                            );
+                            println!(
+                                "  {}",
+                                "╚╗".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                            );
+                            continue;
+                        }
+                        '5' => {
+                            println!(
+                                "  {}{}",
+                                "╠═╩═[_] "
+                                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                    .bold(),
+                                "Successfully exited".bright_green().bold()
+                            );
+                            println!(
+                                "  {}",
+                                "║".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                            );
+                            break;
+                        }
+                        _ => {
+                            println!("{}", "Invalid choice!\n".red().bold());
+                        }
+                    }
+                }
             }
-            '6' => {
+
+            '4' => {
+                println!(
+                    "   {}",
+                    "╚╗".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                );
+                let mut count = 0;
+                loop {
+                    if count == 0 {
+                        print!(
+                            "    {}",
+                            "╠══[?] Enter ID of task to edit: "
+                                .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                .bold()
+                        );
+                        count += 1;
+                    } else {
+                        print!(
+                            "    {}",
+                            "╠══[?] Enter ID of task to edit: "
+                                .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                .bold()
+                        );
+                    }
+
+                    let mut task_id = String::new();
+                    io::stdout().flush().unwrap();
+                    io::stdin()
+                        .read_line(&mut task_id)
+                        .expect("Failed to read line");
+                    let task_id: u16 = match task_id.trim().parse() {
+                        Ok(num) => num,
+                        Err(_) => {
+                            println!(
+                                "    {}",
+                                "╠══[!] Invalid input"
+                                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                    .bold()
+                            );
+                            continue;
+                        }
+                    };
+                    if task_id > 1000 {
+                        println!(
+                            "    {}",
+                            "╠══[!] Enter an ID in the form of a positive integer thats below 1001"
+                                .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                .bold()
+                        );
+                        continue;
+                    }
+
+                    print!(
+                        "    {}",
+                        "╠══[?] [Optional] Enter new name of the task: "
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    let mut new_task_name = String::new();
+                    io::stdout().flush().unwrap();
+                    io::stdin()
+                        .read_line(&mut new_task_name)
+                        .expect("Failed to read line");
+                    let new_task_name = new_task_name.trim().to_string();
+                    println!(
+                        "    {}",
+                        "║ [1] Pending"
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    println!(
+                        "    {}",
+                        "║ [2] Complete"
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    println!(
+                        "    {}",
+                        "║ [3] In-Progress"
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    println!(
+                        "    {}",
+                        "║ [4] Unchanged"
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    print!(
+                        "    {}",
+                        "╠══[?] New Task Status > "
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    let task_status = input(vec!['1', '2', '3', '4']);
+                    let task_status_new = match task_status {
+                        '1' => TaskStatus::Pending,
+                        '2' => TaskStatus::Complete,
+                        '3' => TaskStatus::InProgress,
+                        '4' => TaskStatus::Nth,
+                        _ => TaskStatus::Nth,
+                    };
+                    if new_task_name.is_empty() && task_status_new == TaskStatus::Nth {
+                        println!(
+                            "    {}",
+                            "╠══[_] No changes made to the task"
+                                .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                .bold()
+                        );
+                        print!(
+                            "    {}",
+                            "╠══[?] Would you like to exit? Y/n > "
+                                .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                .bold()
+                        );
+                        let choice = input(vec!['Y', 'y', 'N', 'n']);
+                        match choice {
+                            'Y' | 'y' => {
+                                println!(
+                                    "    {}",
+                                    "╔╝".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                                );
+                                break;
+                            }
+                            'N' | 'n' => {
+                                count += 1;
+                                println!(
+                                    "{}",
+                                    "║".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                                );
+                                continue;
+                            }
+                            _ => {
+                                println!(
+                                    "{}",
+                                    "Invalid choice!\n"
+                                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                        .bold()
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    let r1 = File::open(filepath).unwrap();
+                    BaseTasks::edit_task(task_id, new_task_name, task_status_new, &r1);
+                    drop(r1);
+                    if let Ok(sender) = shared_sender.lock() {
+                        sender.send(EditStatus::Authorized).unwrap_or_else(|e| {
+                            eprintln!("Error sending message: {}", e);
+                        });
+                    }
+                    print!(
+                        "    {}",
+                        "╠══[?] Would you like to exit? Y/n > "
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    let choice = input(vec!['Y', 'y', 'N', 'n']);
+                    match choice {
+                        'Y' | 'y' => {
+                            println!();
+                            break;
+                        }
+                        'N' | 'n' => {}
+                        _ => {
+                            println!(
+                                "{}",
+                                "This was supposed to be unreachable!"
+                                    .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                                    .bold()
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            '5' => {
                 println!(
                     "{}",
                     "   ╚═╦═[Info]: TDA.rs(Todoapp.rs) is a todo list"
@@ -639,13 +1129,71 @@ fn main() {
                         .truecolor(gen_color.0, gen_color.1, gen_color.2)
                         .bold()
                 );
+                thread::sleep(Duration::from_millis(700));
                 println!(
                     "{}",
                     "  ╔╝"
                         .truecolor(gen_color.0, gen_color.1, gen_color.2)
                         .bold()
                 );
+                continue;
             }
+
+            '6' => {
+                let f1 = File::open(filepath).unwrap();
+                let tasks = BaseTasks::read_tasks(&f1);
+                if tasks.is_empty() {
+                    println!(
+                        "   {}",
+                        "╠═[!] No tasks found"
+                            .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                            .bold()
+                    );
+                    thread::sleep(Duration::from_millis(400));
+                    println!(
+                        "  {}",
+                        "╔╝".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                    );
+                    drop(f1);
+                    continue;
+                }
+                drop(f1);
+                let f2 = OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(filepath)
+                    .unwrap();
+                BaseTasks::init(&f2);
+                send_edit_status(
+                    Arc::clone(&shared_sender),
+                    Arc::clone(&status_acknowledged_clone),
+                );
+                println!(
+                    "   {}{}",
+                    "╠═[-] "
+                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                        .bold(),
+                    "All tasks have been removed".bright_green().bold()
+                );
+                println!(
+                    "  {}",
+                    "╔╝".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                );
+            }
+
+            '7' => {
+                println!(
+                    "{}{}{}",
+                    "   ╚══[ "
+                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                        .bold(),
+                    "Goodbye".green().bold(),
+                    " ]".truecolor(gen_color.0, gen_color.1, gen_color.2).bold()
+                );
+                thread::sleep(Duration::from_secs(1));
+                std::process::exit(0);
+            }
+
             _ => {
                 println!(
                     "{}",
@@ -662,7 +1210,9 @@ fn main() {
                 );
                 println!(
                     "{}",
-                    "  ╔╝".truecolor(gen_color.0, gen_color.1, gen_color.2)
+                    "  ╔╝"
+                        .truecolor(gen_color.0, gen_color.1, gen_color.2)
+                        .bold()
                 );
                 continue;
             }
